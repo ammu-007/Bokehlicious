@@ -178,3 +178,8 @@ cython_debug/
 /dataset/EBB_Val294/
 /output/
 /dataset/Bokeh_NTIRE2026/
+/dataset/Bokeh_NTIRE2026_Development_Inputs
+dataset/RealBokeh_Parquet
+runs/
+*.json
+.agent/

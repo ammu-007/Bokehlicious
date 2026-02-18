@@ -30,6 +30,39 @@ def get_eval_parser():
     parser.add_argument('--save_outputs', action='store_true')
     return parser
 
+def get_train_parser():
+    parser = ArgumentParser(description='Train Bokehlicious on the RealBokeh dataset.')
+    # Model
+    parser.add_argument('-size', type=str, required=True, choices=['small', 'large'],
+                        help='Model size to train')
+    parser.add_argument('-device', type=str, default='cuda', choices=['cuda', 'cpu'])
+    # Data
+    parser.add_argument('-data_path', type=Path, default='./dataset/RealBokeh_3MP',
+                        help='Path to RealBokeh_3MP directory (must contain train/ and validation/ subdirs)')
+    parser.add_argument('-num_workers', type=int, default=4,
+                        help='DataLoader worker processes (default: 4, use 0 for debugging)')
+    # Training hyperparameters (paper: batch=4, patch=512, lr=5e-4, lambda=0.6)
+    parser.add_argument('-epochs', type=int, default=200)
+    parser.add_argument('-batch_size', type=int, default=4)
+    parser.add_argument('-patch_size', type=int, default=512,
+                        help='Random crop size for training patches (paper: 512)')
+    parser.add_argument('-lr', type=float, default=5e-4,
+                        help='Adam learning rate (paper: 5e-4)')
+    parser.add_argument('-lambda_lpips', type=float, default=0.6,
+                        help='LPIPS loss weight (paper Eq. 5: lambda=0.6)')
+    # Checkpointing & logging
+    parser.add_argument('-checkpoint_dir', type=Path, default='./checkpoints',
+                        help='Directory to save checkpoints')
+    parser.add_argument('-resume', type=Path, default=None,
+                        help='Path to checkpoint to resume training from')
+    parser.add_argument('-log_dir', type=Path, default='./runs',
+                        help='TensorBoard log directory')
+    parser.add_argument('-val_freq', type=int, default=5,
+                        help='Validate every N epochs')
+    parser.add_argument('-save_freq', type=int, default=10,
+                        help='Save a periodic checkpoint every N epochs')
+    return parser
+
 def get_ntire_parser():
     parser = get_base_parser()
     parser.description=(
