@@ -1,0 +1,37 @@
+experiment:
+  name: "bokehlicious_small_baseline"
+
+model:
+  size: "small"        # options: "small", "large"
+  device: "cuda"       # options: "cuda", "cpu"
+
+data:
+  path: "./dataset/RealBokeh_Extracted"
+  dataset_type: "extracted"  # options: "extracted", "parquet", "imagefolder"
+  num_workers: 4
+
+training:
+  epochs: 200
+  batch_size: 4
+  patch_size: 512
+  lr: 5.0e-4
+  lambda_lpips: 0.6
+  val_freq: 5
+  save_freq: 10
+  resume: null         # path to a .pt file to resume training
+
+logging:
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+
+inference:
+  dataset: "RealBokeh"         # options: RealBokeh, RealBokeh_bin, EBB400, EBB_Val294
+  save_outputs: false
+  image_format: "png"          # options: png, jpg
+  out_path: "./output"
+  
+  # For predict.py (single image prediction)
+  img_path: "./image.jpg"      # Path to input image
+  av: 2.0                      # Target aperture (blur amount)
+  max_dim: 2000                # Maximum dimension to resize to
+  min_divisor: 4               # Ensure dimensions are divisible by this

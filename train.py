@@ -18,6 +18,8 @@ Usage:
 
 from pathlib import Path
 from typing import Tuple
+import yaml
+
 
 import torch
 import torch.nn as nn
@@ -31,7 +33,7 @@ from torchmetrics.functional.image import (
     learned_perceptual_image_patch_similarity as lpips_fn,
 )
 
-from dataset.loader import RealBokehTrain, RealBokeh, RealBokehParquet
+from dataset.loader import RealBokehTrain, RealBokeh, RealBokehParquet, RealBokehExtracted
 from dataset.util import Mode
 from method.config import bokehlicious_size_builder
 from method.model import Bokehlicious
@@ -106,23 +108,45 @@ def validate(model: Bokehlicious, val_dataset, device: str) -> dict:
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(args):
-    device = args.device
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    args.log_dir.mkdir(parents=True, exist_ok=True)
+def train(config: dict):
+    # Parse config values
+    exp_name = config['experiment']['name']
+    
+    size   = config['model']['size']
+    device = config['model']['device']
+    
+    data_path    = Path(config['data']['path'])
+    dataset_type = config['data'].get('dataset_type', 'imagefolder')
+    num_workers  = config['data']['num_workers']
+    
+    epochs       = config['training']['epochs']
+    batch_size   = config['training']['batch_size']
+    patch_size   = config['training']['patch_size']
+    lr           = float(config['training']['lr'])
+    lambda_lpips = float(config['training']['lambda_lpips'])
+    val_freq     = config['training']['val_freq']
+    save_freq    = config['training']['save_freq']
+    resume       = config['training'].get('resume')
+    
+    checkpoint_dir = Path(config['logging']['checkpoint_dir']) / exp_name
+    log_dir        = Path(config['logging']['log_dir']) / exp_name
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Model ----
-    config = bokehlicious_size_builder(args.size)
-    model = Bokehlicious(**config).to(device)
+    model_config = bokehlicious_size_builder(size)
+    model = Bokehlicious(**model_config).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Initialized Bokehlicious-{args.size} ({total_params:,} parameters) on {device}")
+    print(f"Initialized Bokehlicious-{size} ({total_params:,} parameters) on {device}")
+    print(f"Experiment: {exp_name}")
 
     # ---- Resume ----
     start_epoch = 0
     best_psnr = 0.0
-    if args.resume is not None:
-        print(f"Resuming from checkpoint: {args.resume}")
-        state = torch.load(args.resume, map_location=device)
+    if resume is not None and resume != "null" and resume != "":
+        print(f"Resuming from checkpoint: {resume}")
+        state = torch.load(resume, map_location=device)
         if isinstance(state, dict) and 'model' in state:
             model.load_state_dict(state['model'])
             start_epoch = state.get('epoch', 0) + 1
@@ -133,49 +157,52 @@ def train(args):
             print("  Loaded plain weights dict.")
 
     # ---- Datasets ----
-    use_parquet = getattr(args, 'parquet', False)
-
-    if use_parquet:
-        train_dir = Path(args.data_path) / 'train'
-        val_dir   = Path(args.data_path) / 'validation'
-        train_dataset = RealBokehParquet(train_dir, patch_size=args.patch_size, augment=True)
-        val_dataset   = RealBokehParquet(val_dir,   patch_size=None,            augment=False)
+    if dataset_type == 'extracted':
+        train_dir = data_path / 'train'
+        val_dir   = data_path / 'validation'
+        train_dataset = RealBokehExtracted(train_dir, patch_size=patch_size, augment=True)
+        val_dataset   = RealBokehExtracted(val_dir,   patch_size=None,       augment=False)
+    elif dataset_type == 'parquet':
+        train_dir = data_path / 'train'
+        val_dir   = data_path / 'validation'
+        train_dataset = RealBokehParquet(train_dir, patch_size=patch_size, augment=True)
+        val_dataset   = RealBokehParquet(val_dir,   patch_size=None,       augment=False)
     else:
-        train_dataset = RealBokehTrain(args.data_path, patch_size=args.patch_size)
-        val_dataset   = RealBokeh(args.data_path, mode=Mode.VAL, device='cpu')
+        train_dataset = RealBokehTrain(data_path, patch_size=patch_size)
+        val_dataset   = RealBokeh(data_path, mode=Mode.VAL, device='cpu')
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=(device == 'cuda'),
         drop_last=True,
     )
 
     # ---- Optimizer & Scheduler ----
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-7
+        optimizer, T_max=epochs, eta_min=1e-7
     )
     if start_epoch > 0:
         for _ in range(start_epoch):
             scheduler.step()
 
     # ---- Loss ----
-    criterion = BokehliciousLoss(lambda_lpips=args.lambda_lpips)
+    criterion = BokehliciousLoss(lambda_lpips=lambda_lpips)
 
     # ---- TensorBoard ----
-    writer = SummaryWriter(log_dir=str(args.log_dir / args.size))
-    print(f"TensorBoard: tensorboard --logdir {args.log_dir}\n")
+    writer = SummaryWriter(log_dir=str(log_dir))
+    print(f"TensorBoard: tensorboard --logdir {log_dir.parent}\n")
 
     # ---- Training ----
     global_step = start_epoch * len(train_loader)
 
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
 
         for batch in pbar:
             source             = batch['source'].to(device)
@@ -214,12 +241,12 @@ def train(args):
 
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{args.epochs} — avg loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{epochs} — avg loss: {avg_loss:.4f}")
         writer.add_scalar('train/epoch_loss', avg_loss, epoch)
 
         # Periodic checkpoint
-        if (epoch + 1) % args.save_freq == 0:
-            ckpt_path = args.checkpoint_dir / f"{args.size}_epoch{epoch+1}.pt"
+        if (epoch + 1) % save_freq == 0:
+            ckpt_path = checkpoint_dir / f"{size}_epoch{epoch+1}.pt"
             torch.save({
                 'model':     model.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -229,7 +256,7 @@ def train(args):
             print(f"  Saved checkpoint: {ckpt_path}")
 
         # Validation
-        if (epoch + 1) % args.val_freq == 0:
+        if (epoch + 1) % val_freq == 0:
             print("  Running validation...")
             metrics = validate(model, val_dataset, device)
             print(f"  Val PSNR: {metrics['psnr']:.4f} | SSIM: {metrics['ssim']:.4f} | LPIPS: {metrics['lpips']:.4f}")
@@ -239,18 +266,20 @@ def train(args):
 
             if metrics['psnr'] > best_psnr:
                 best_psnr = metrics['psnr']
-                best_path = args.checkpoint_dir / f"{args.size}_best.pt"
+                best_path = checkpoint_dir / f"{size}_best.pt"
                 torch.save(model.state_dict(), best_path)
                 print(f"  New best PSNR {best_psnr:.4f} -> saved to {best_path}")
 
     writer.close()
     print(f"\nTraining complete. Best PSNR: {best_psnr:.4f}")
-    print(f"Best model: {args.checkpoint_dir / f'{args.size}_best.pt'}")
+    print(f"Best model: {checkpoint_dir / f'{size}_best.pt'}")
 
 
 if __name__ == '__main__':
     parser = get_train_parser()
-    parser.add_argument('--parquet', action='store_true',
-                        help='Use parquet dataset (from download_dataset.py) instead of raw imagefolder')
     args = parser.parse_args()
-    train(args)
+    
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+        
+    train(config)

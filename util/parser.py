@@ -1,70 +1,26 @@
 from argparse import ArgumentParser
 from pathlib import Path
 
-def get_base_parser():
-    parser = ArgumentParser()
-    parser.add_argument('-out_path', type=Path, default='./output', help='output folder, default is \'./output\'')
-    parser.add_argument('-image_format', type=str, default='png', choices=['png', 'jpg'], help='image format for saving outputs')
-    return parser
-
-def add_network_args(parser: ArgumentParser):
-    parser.add_argument('-size', type=str, required=True, choices=['small', 'large', 'defocus_deblur'])
-    parser.add_argument('-device', type=str, default='cuda', choices=['cuda', 'cpu'])
-
-def add_img_args(parser: ArgumentParser):
-    parser.add_argument('-img_path', type=str, required=True)
-    parser.add_argument('-av', type=float, default=2.0)
-    parser.add_argument('-max_dim', type=int, default=2000)
-    parser.add_argument('-min_divisor', type=int, default=4)
-
 def get_predict_parser():
-    parser = get_base_parser()
-    add_network_args(parser)
-    add_img_args(parser)
+    parser = ArgumentParser()
+    parser.add_argument('-c', '--config', type=Path, default='./configs/default.yaml',
+                        help='Path to the YAML configuration file for the experiment.')
     return parser
 
 def get_eval_parser():
-    parser = get_base_parser()
-    add_network_args(parser)
-    parser.add_argument('-dataset', type=str, required=True, choices=['RealBokeh', 'RealBokeh_bin', 'EBB400', 'EBB_Val294'])
-    parser.add_argument('--save_outputs', action='store_true')
+    parser = ArgumentParser()
+    parser.add_argument('-c', '--config', type=Path, default='./configs/default.yaml',
+                        help='Path to the YAML configuration file for the experiment.')
     return parser
 
 def get_train_parser():
     parser = ArgumentParser(description='Train Bokehlicious on the RealBokeh dataset.')
-    # Model
-    parser.add_argument('-size', type=str, required=True, choices=['small', 'large'],
-                        help='Model size to train')
-    parser.add_argument('-device', type=str, default='cuda', choices=['cuda', 'cpu'])
-    # Data
-    parser.add_argument('-data_path', type=Path, default='./dataset/RealBokeh_3MP',
-                        help='Path to RealBokeh_3MP directory (must contain train/ and validation/ subdirs)')
-    parser.add_argument('-num_workers', type=int, default=4,
-                        help='DataLoader worker processes (default: 4, use 0 for debugging)')
-    # Training hyperparameters (paper: batch=4, patch=512, lr=5e-4, lambda=0.6)
-    parser.add_argument('-epochs', type=int, default=200)
-    parser.add_argument('-batch_size', type=int, default=4)
-    parser.add_argument('-patch_size', type=int, default=512,
-                        help='Random crop size for training patches (paper: 512)')
-    parser.add_argument('-lr', type=float, default=5e-4,
-                        help='Adam learning rate (paper: 5e-4)')
-    parser.add_argument('-lambda_lpips', type=float, default=0.6,
-                        help='LPIPS loss weight (paper Eq. 5: lambda=0.6)')
-    # Checkpointing & logging
-    parser.add_argument('-checkpoint_dir', type=Path, default='./checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('-resume', type=Path, default=None,
-                        help='Path to checkpoint to resume training from')
-    parser.add_argument('-log_dir', type=Path, default='./runs',
-                        help='TensorBoard log directory')
-    parser.add_argument('-val_freq', type=int, default=5,
-                        help='Validate every N epochs')
-    parser.add_argument('-save_freq', type=int, default=10,
-                        help='Save a periodic checkpoint every N epochs')
+    parser.add_argument('-c', '--config', type=Path, default='./configs/default.yaml',
+                        help='Path to the YAML configuration file for the experiment.')
     return parser
 
 def get_ntire_parser():
-    parser = get_base_parser()
+    parser = ArgumentParser()
     parser.description=(
         "This script produces a submission ready .zip archive to be uploaded at "
         "https://www.codabench.org/competitions/12764/#/participate-tab for evaluation by our server. \n"

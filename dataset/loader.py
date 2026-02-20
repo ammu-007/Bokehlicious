@@ -350,3 +350,111 @@ class RealBokehParquet(Dataset):
         maps = generate_maps(source, aperture_embedding, target=target)
         stem = Path(target_path).stem
         return build_input_dict(maps, aperture_embedding, stem, device='cpu')
+
+
+class RealBokehExtracted(Dataset):
+    """
+    Fast file-based dataset for images extracted from parquet via extract_parquet.py.
+
+    Expected directory layout (flat, all images in one folder per split):
+        {split_dir}/
+            1_f2.0.JPG
+            1_f20.JPG      <- source (f/22)
+            1_f4.0.JPG
+            10_f2.0.JPG
+            ...
+
+    Groups files by scene_id, pairs source (f20) with each target f-stop.
+    Reading directly from disk is much faster than loading parquet into RAM.
+
+    Args:
+        split_dir:  Path to the extracted split directory (e.g. ./dataset/RealBokeh_Extracted/train).
+        patch_size: Random crop size. None = full image (for validation).
+        augment:    Whether to apply random horizontal flip.
+    """
+
+    SOURCE_FTAG = 'f20'  # f/22 source image
+
+    def __init__(self, split_dir: Union[str, Path],
+                 patch_size: Optional[int] = 512,
+                 augment: bool = True):
+        self._split_dir = Path(split_dir)
+        self._patch_size = patch_size
+        self._augment = augment
+
+        if not self._split_dir.exists():
+            raise FileNotFoundError(
+                f"Extracted dataset directory not found: {self._split_dir.absolute()}\n"
+                f"Run: .venv\\Scripts\\python.exe extract_parquet.py"
+            )
+
+        # Collect all JPEG files
+        all_files = sorted(
+            list(self._split_dir.glob('*.JPG')) +
+            list(self._split_dir.glob('*.jpg'))
+        )
+        if not all_files:
+            raise FileNotFoundError(f"No JPEG files found in {self._split_dir.absolute()}")
+
+        # Group by scene_id: filename format is "{scene_id}_f{aperture}.JPG"
+        from collections import defaultdict
+        scenes = defaultdict(dict)  # scene_id -> {f_tag -> Path}
+        for fpath in all_files:
+            stem = fpath.stem  # e.g. "1_f2.0"
+            parts = stem.split('_')
+            scene_id = parts[0]
+            f_tag = '_'.join(parts[1:])  # e.g. "f2.0", "f20"
+            scenes[scene_id][f_tag] = fpath
+
+        # Build flat sample list: (source_path, target_path, target_av)
+        self._samples = []
+        for scene_id, images in scenes.items():
+            source_path = images.get(self.SOURCE_FTAG)
+            if source_path is None:
+                continue
+            for f_tag, target_path in images.items():
+                if f_tag == self.SOURCE_FTAG:
+                    continue
+                try:
+                    av = float(f_tag.lstrip('f'))
+                except ValueError:
+                    continue
+                self._samples.append((source_path, target_path, av))
+
+        print(f"RealBokehExtracted: {self._split_dir.name} — "
+              f"{len(scenes)} scenes, {len(self._samples)} pairs")
+
+    def __len__(self):
+        return len(self._samples)
+
+    def __getitem__(self, index: int):
+        source_path, target_path, tgt_av = self._samples[index]
+
+        source = Image.open(source_path).convert('RGB')
+        target = Image.open(target_path).convert('RGB')
+
+        # Random crop
+        if self._patch_size is not None:
+            w, h = source.size
+            p = self._patch_size
+            if w < p or h < p:
+                scale = max(p / w, p / h) + 0.01
+                new_w, new_h = int(w * scale), int(h * scale)
+                source = source.resize((new_w, new_h), Image.Resampling.BICUBIC)
+                target = target.resize((new_w, new_h), Image.Resampling.BICUBIC)
+                w, h = source.size
+            left = random.randint(0, w - p)
+            top  = random.randint(0, h - p)
+            box  = (left, top, left + p, top + p)
+            source = source.crop(box)
+            target = target.crop(box)
+
+        # Random horizontal flip
+        if self._augment and random.random() > 0.5:
+            source = ImageOps.mirror(source)
+            target = ImageOps.mirror(target)
+
+        aperture_embedding = calculate_aperture_embedding(tgt_av)
+        maps = generate_maps(source, aperture_embedding, target=target)
+        return build_input_dict(maps, aperture_embedding,
+                                target_path.stem, device='cpu')
