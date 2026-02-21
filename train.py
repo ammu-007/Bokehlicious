@@ -464,11 +464,25 @@ def train(config: dict):
             writer.add_scalar('Loss/epoch_avg', avg_loss, epoch)
 
             # ---- Weight & gradient histograms ----
+            # TensorBoard's add_histogram uses NumPy internally and only
+            # supports float32. Cast everything to float32 on CPU first to
+            # avoid "No loop matching signature" TypeError with bfloat16/fp16.
             for name, param in raw_model.named_parameters():
                 if param.requires_grad:
-                    writer.add_histogram(f'Weights/{name}', param.data, epoch)
-                    if param.grad is not None:
-                        writer.add_histogram(f'Gradients/{name}', param.grad.data, epoch)
+                    try:
+                        writer.add_histogram(
+                            f'Weights/{name}',
+                            param.data.detach().cpu().float(),
+                            epoch,
+                        )
+                        if param.grad is not None:
+                            writer.add_histogram(
+                                f'Gradients/{name}',
+                                param.grad.data.detach().cpu().float(),
+                                epoch,
+                            )
+                    except Exception as hist_e:
+                        logger.warning(f"  add_histogram failed for '{name}': {hist_e}")
 
             writer.flush()
 

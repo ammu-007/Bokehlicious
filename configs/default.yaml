@@ -19,10 +19,15 @@ training:
   val_freq: 5
   save_freq: 10
   resume: null         # path to a .pt file to resume training
+  seed: 42
+  log_interval: 50     # log metrics every N iterations
+  grad_clip_norm: 1.0  # max gradient norm for clipping
+  sample_log_freq: 5   # log sample images to TensorBoard every N epochs
 
 logging:
   checkpoint_dir: "./checkpoints"
   log_dir: "./logs"
+  log_file: "train.log" # Python logging FileHandler output file
 
 inference:
   dataset: "RealBokeh"         # options: RealBokeh, RealBokeh_bin, EBB400, EBB_Val294
