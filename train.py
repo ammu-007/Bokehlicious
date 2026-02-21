@@ -16,14 +16,16 @@ Usage:
     .venv\\Scripts\\python.exe train.py -size small -data_path ./dataset/RealBokeh_Parquet --parquet -epochs 1 -batch_size 1 -patch_size 128 -num_workers 0 -device cpu
 """
 
-from pathlib import Path
 from typing import Tuple
 import yaml
-
+import os
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 
@@ -131,30 +133,53 @@ def train(config: dict):
     checkpoint_dir = Path(config['logging']['checkpoint_dir']) / exp_name
     log_dir        = Path(config['logging']['log_dir']) / exp_name
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # ---- DDP Setup ----
+    is_ddp = "LOCAL_RANK" in os.environ
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        global_rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(device)
+    else:
+        local_rank, global_rank, world_size = 0, 0, 1
+        device = config['model']['device']
+
+    if global_rank == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Model ----
     model_config = bokehlicious_size_builder(size)
     model = Bokehlicious(**model_config).to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Initialized Bokehlicious-{size} ({total_params:,} parameters) on {device}")
-    print(f"Experiment: {exp_name}")
+    
+    if global_rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Initialized Bokehlicious-{size} ({total_params:,} parameters) on {device}")
+        print(f"Experiment: {exp_name} | DDP: {is_ddp} (World Size: {world_size})")
 
     # ---- Resume ----
     start_epoch = 0
     best_psnr = 0.0
     if resume is not None and resume != "null" and resume != "":
-        print(f"Resuming from checkpoint: {resume}")
+        if global_rank == 0:
+            print(f"Resuming from checkpoint: {resume}")
         state = torch.load(resume, map_location=device)
         if isinstance(state, dict) and 'model' in state:
             model.load_state_dict(state['model'])
             start_epoch = state.get('epoch', 0) + 1
             best_psnr = state.get('best_psnr', 0.0)
-            print(f"  Resumed at epoch {start_epoch}, best PSNR: {best_psnr:.4f}")
+            if global_rank == 0:
+                print(f"  Resumed at epoch {start_epoch}, best PSNR: {best_psnr:.4f}")
         else:
             model.load_state_dict(state)
-            print("  Loaded plain weights dict.")
+            if global_rank == 0:
+                print("  Loaded plain weights dict.")
+
+    # Wrap model in DDP after loading checkpoint
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank])
 
     # ---- Datasets ----
     if dataset_type == 'extracted':
@@ -171,13 +196,19 @@ def train(config: dict):
         train_dataset = RealBokehTrain(data_path, patch_size=patch_size)
         val_dataset   = RealBokeh(data_path, mode=Mode.VAL, device='cpu')
 
+    if is_ddp:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True, drop_last=True)
+    else:
+        train_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=(device == 'cuda'),
-        drop_last=True,
+        pin_memory=(device.startswith('cuda') or device == 'cuda'),
+        drop_last=True if not is_ddp else False,
     )
 
     # ---- Optimizer & Scheduler ----
@@ -193,16 +224,26 @@ def train(config: dict):
     criterion = BokehliciousLoss(lambda_lpips=lambda_lpips)
 
     # ---- TensorBoard ----
-    writer = SummaryWriter(log_dir=str(log_dir))
-    print(f"TensorBoard: tensorboard --logdir {log_dir.parent}\n")
+    if global_rank == 0:
+        writer = SummaryWriter(log_dir=str(log_dir))
+        print(f"TensorBoard: tensorboard --logdir {log_dir.parent}\n")
+    else:
+        writer = None
 
     # ---- Training ----
     global_step = start_epoch * len(train_loader)
 
     for epoch in range(start_epoch, epochs):
+        if is_ddp:
+            train_sampler.set_epoch(epoch)
+            
         model.train()
         epoch_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        
+        if global_rank == 0:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        else:
+            pbar = train_loader
 
         for batch in pbar:
             source             = batch['source'].to(device)
@@ -226,29 +267,38 @@ def train(config: dict):
             epoch_loss += loss_dict['total']
             global_step += 1
 
-            pbar.set_postfix(
-                loss=f"{loss_dict['total']:.4f}",
-                l1=f"{loss_dict['l1']:.4f}",
-                lpips=f"{loss_dict['lpips']:.4f}",
-                lr=f"{scheduler.get_last_lr()[0]:.2e}",
-            )
+            if global_rank == 0:
+                pbar.set_postfix(
+                    loss=f"{loss_dict['total']:.4f}",
+                    l1=f"{loss_dict['l1']:.4f}",
+                    lpips=f"{loss_dict['lpips']:.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
 
-            if global_step % 100 == 0:
-                writer.add_scalar('train/loss_total', loss_dict['total'], global_step)
-                writer.add_scalar('train/loss_l1',    loss_dict['l1'],    global_step)
-                writer.add_scalar('train/loss_lpips', loss_dict['lpips'], global_step)
-                writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
+                if global_step % 100 == 0:
+                    writer.add_scalar('train/loss_total', loss_dict['total'], global_step)
+                    writer.add_scalar('train/loss_l1',    loss_dict['l1'],    global_step)
+                    writer.add_scalar('train/loss_lpips', loss_dict['lpips'], global_step)
+                    writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
 
+        if is_ddp:
+            # Sync epoch loss across GPUs
+            epoch_loss_tensor = torch.tensor(epoch_loss, device=device)
+            dist.all_reduce(epoch_loss_tensor, op=dist.ReduceOp.SUM)
+            epoch_loss = epoch_loss_tensor.item()
+            
         scheduler.step()
-        avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs} — avg loss: {avg_loss:.4f}")
-        writer.add_scalar('train/epoch_loss', avg_loss, epoch)
+        avg_loss = epoch_loss / (len(train_loader) * world_size)
+        
+        if global_rank == 0:
+            print(f"Epoch {epoch+1}/{epochs} — avg loss: {avg_loss:.4f}")
+            writer.add_scalar('train/epoch_loss', avg_loss, epoch)
 
         # Periodic checkpoint
-        if (epoch + 1) % save_freq == 0:
+        if global_rank == 0 and (epoch + 1) % save_freq == 0:
             ckpt_path = checkpoint_dir / f"{size}_epoch{epoch+1}.pt"
             torch.save({
-                'model':     model.state_dict(),
+                'model':     model.module.state_dict() if is_ddp else model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch':     epoch,
                 'best_psnr': best_psnr,
@@ -257,22 +307,31 @@ def train(config: dict):
 
         # Validation
         if (epoch + 1) % val_freq == 0:
-            print("  Running validation...")
-            metrics = validate(model, val_dataset, device)
-            print(f"  Val PSNR: {metrics['psnr']:.4f} | SSIM: {metrics['ssim']:.4f} | LPIPS: {metrics['lpips']:.4f}")
-            writer.add_scalar('val/psnr',  metrics['psnr'],  epoch)
-            writer.add_scalar('val/ssim',  metrics['ssim'],  epoch)
-            writer.add_scalar('val/lpips', metrics['lpips'], epoch)
+            if global_rank == 0:
+                print("  Running validation...")
+                metrics = validate(model.module if is_ddp else model, val_dataset, device)
+                print(f"  Val PSNR: {metrics['psnr']:.4f} | SSIM: {metrics['ssim']:.4f} | LPIPS: {metrics['lpips']:.4f}")
+                writer.add_scalar('val/psnr',  metrics['psnr'],  epoch)
+                writer.add_scalar('val/ssim',  metrics['ssim'],  epoch)
+                writer.add_scalar('val/lpips', metrics['lpips'], epoch)
 
-            if metrics['psnr'] > best_psnr:
-                best_psnr = metrics['psnr']
-                best_path = checkpoint_dir / f"{size}_best.pt"
-                torch.save(model.state_dict(), best_path)
-                print(f"  New best PSNR {best_psnr:.4f} -> saved to {best_path}")
+                if metrics['psnr'] > best_psnr:
+                    best_psnr = metrics['psnr']
+                    best_path = checkpoint_dir / f"{size}_best.pt"
+                    torch.save(model.module.state_dict() if is_ddp else model.state_dict(), best_path)
+                    print(f"  New best PSNR {best_psnr:.4f} -> saved to {best_path}")
+            
+            # Synchronize so other processes don't race ahead
+            if is_ddp:
+                dist.barrier()
 
-    writer.close()
-    print(f"\nTraining complete. Best PSNR: {best_psnr:.4f}")
-    print(f"Best model: {checkpoint_dir / f'{size}_best.pt'}")
+    if global_rank == 0:
+        writer.close()
+        print(f"\nTraining complete. Best PSNR: {best_psnr:.4f}")
+        print(f"Best model: {checkpoint_dir / f'{size}_best.pt'}")
+        
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
