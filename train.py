@@ -347,23 +347,6 @@ def train(config: dict):
         import json
         writer.add_text('Config', f"```json\n{json.dumps(config, indent=2)}\n```", 0)
 
-        # Log model graph
-        try:
-            sample = train_dataset[0]
-            dummy_input = {
-                k: v.unsqueeze(0).to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in sample.items()
-            }
-            writer.add_graph(raw_model, (
-                dummy_input['source'],
-                dummy_input['bokeh_strength'],
-                dummy_input['pos_map'],
-                dummy_input['bokeh_strength_map'],
-            ))
-            logger.info("  -> Logged model graph to TensorBoard.")
-        except Exception as e:
-            logger.warning(f"  -> Could not log model graph: {e}")
-
     logger.info("")
 
     # ---- Training ----
