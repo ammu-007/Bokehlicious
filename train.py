@@ -14,18 +14,13 @@ Usage:
     .venv\\Scripts\\python.exe train.py --config configs/smoke_test.yaml
 """
 
-import logging
-import os
-import random
-import subprocess
+import datetime
 import time
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional
 
-import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -38,158 +33,21 @@ import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
-from torchmetrics.functional.image import (
-    peak_signal_noise_ratio as psnr_fn,
-    structural_similarity_index_measure as ssim_fn,
-    learned_perceptual_image_patch_similarity as lpips_fn,
-)
-
 from dataset.loader import RealBokehTrain, RealBokeh, RealBokehParquet, RealBokehExtracted
 from dataset.util import Mode
 from method.config import bokehlicious_size_builder
 from method.model import Bokehlicious
 from util.parser import get_train_parser
 
-
-# ---------------------------------------------------------------------------
-# Logging Setup
-# ---------------------------------------------------------------------------
-
-class RankFilter(logging.Filter):
-    """Injects `rank` into every log record."""
-    def __init__(self, rank: int):
-        super().__init__()
-        self.rank = rank
-
-    def filter(self, record):
-        record.rank = self.rank
-        return True
-
-
-def setup_logging(rank: int, log_dir: Path, log_file: str) -> logging.Logger:
-    """
-    Configure Python logging with rank-aware formatting.
-    - All ranks get a StreamHandler (console) for WARNING+
-    - Rank 0 gets an additional StreamHandler for INFO+ and a FileHandler.
-    """
-    logger = logging.getLogger("bokehlicious")
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()  # prevent duplicate handlers on re-calls
-
-    fmt = logging.Formatter(
-        "[%(asctime)s] [Rank %(rank)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    rank_filter = RankFilter(rank)
-
-    if rank == 0:
-        # Console — INFO level
-        console = logging.StreamHandler()
-        console.setLevel(logging.INFO)
-        console.setFormatter(fmt)
-        console.addFilter(rank_filter)
-        logger.addHandler(console)
-
-        # File — DEBUG level (captures everything)
-        fh = logging.FileHandler(str(log_dir / log_file), mode="a", encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        fh.addFilter(rank_filter)
-        logger.addHandler(fh)
-    else:
-        # Non-rank-0 processes: only WARNING+ to console
-        console = logging.StreamHandler()
-        console.setLevel(logging.WARNING)
-        console.setFormatter(fmt)
-        console.addFilter(rank_filter)
-        logger.addHandler(console)
-
-    return logger
-
-
-def get_git_hash() -> Optional[str]:
-    """Return the short git commit hash, or None if not in a git repo."""
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL
-        ).decode("ascii").strip()
-    except Exception:
-        return None
-
-
-def set_seeds(seed: int):
-    """Set all random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-class BokehliciousLoss(nn.Module):
-    """
-    Paper Eq. 5:  L = L1(output, target) + lambda * LPIPS_VGG(output, target)
-    lambda = 0.6 by default.
-    """
-    def __init__(self, lambda_lpips: float = 0.6):
-        super().__init__()
-        self.lambda_lpips = lambda_lpips
-        self.l1 = nn.L1Loss()
-
-    def forward(self, output: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        l1_loss = self.l1(output, target)
-        lpips_loss = lpips_fn(output.clamp(0, 1), target.clamp(0, 1),
-                              normalize=True, net_type='vgg')
-        total = l1_loss + self.lambda_lpips * lpips_loss
-        return total, {
-            'l1':    l1_loss.item(),
-            'lpips': lpips_loss.item(),
-            'total': total.item(),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def validate(model: nn.Module, val_dataset, device: str,
-             logger: logging.Logger) -> dict:
-    """Run validation on rank 0. Returns metric averages."""
-    model.eval()
-    psnr_vals, ssim_vals, lpips_vals = [], [], []
-
-    for idx in tqdm(range(len(val_dataset)), desc='Validating', leave=False):
-        batch = val_dataset[idx]
-        inputs = {k: v.unsqueeze(0).to(device) if isinstance(v, torch.Tensor) else v
-                  for k, v in batch.items()}
-
-        output = model(
-            source=inputs['source'],
-            bokeh_strength=inputs['bokeh_strength'],
-            pos_map=inputs['pos_map'],
-            bokeh_strength_map=inputs['bokeh_strength_map'],
-        ).clamp(0, 1)
-
-        target = inputs['target']
-        psnr_vals.append(psnr_fn(output, target, data_range=1.0).item())
-        ssim_vals.append(ssim_fn(output, target, data_range=1.0).item())
-        lpips_vals.append(lpips_fn(output, target, normalize=True).item())
-
-    model.train()
-    n = len(psnr_vals)
-    return {
-        'psnr':  sum(psnr_vals)  / n,
-        'ssim':  sum(ssim_vals)  / n,
-        'lpips': sum(lpips_vals) / n,
-    }
+from training import (
+    setup_logging,
+    get_git_hash,
+    set_seeds,
+    BokehliciousLoss,
+    validate,
+    setup_ddp,
+    cleanup_ddp,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -224,22 +82,7 @@ def train(config: dict):
     log_file       = config['logging'].get('log_file', 'train.log')
 
     # ---- DDP Setup ----
-    is_ddp = "LOCAL_RANK" in os.environ
-    if is_ddp:
-        from datetime import timedelta
-        # Increase timeout to 3 hours to accommodate long validation runs.
-        # DDP's forward() broadcasts buffers as a collective op (BROADCAST),
-        # so ALL ranks must participate. If rank 0 is validating for 30+ min
-        # while other ranks are waiting, the default 30-min timeout kills them.
-        dist.init_process_group(backend="nccl", timeout=timedelta(hours=3))
-        local_rank  = int(os.environ["LOCAL_RANK"])
-        global_rank = int(os.environ["RANK"])
-        world_size  = int(os.environ["WORLD_SIZE"])
-        device = f"cuda:{local_rank}"
-        torch.cuda.set_device(device)
-    else:
-        local_rank, global_rank, world_size = 0, 0, 1
-        device = config['model']['device']
+    local_rank, global_rank, world_size, device, is_ddp = setup_ddp(device)
 
     # ---- Directories (rank 0 creates, then barrier) ----
     if global_rank == 0:
@@ -416,11 +259,11 @@ def train(config: dict):
                     loss=f"{loss_dict['total']:.4f}",
                     l1=f"{loss_dict['l1']:.4f}",
                     lpips=f"{loss_dict['lpips']:.4f}",
-                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
                 )
 
                 if global_step % log_interval == 0:
-                    current_lr = scheduler.get_last_lr()[0]
+                    current_lr = optimizer.param_groups[0]['lr']
                     gpu_mem_mb = (torch.cuda.memory_reserved(device) / 1024**2) if device.startswith('cuda') else 0.0
 
                     logger.info(
@@ -447,11 +290,12 @@ def train(config: dict):
         scheduler.step()
         avg_loss = epoch_loss / (len(train_loader) * world_size)
         epoch_time = time.time() - epoch_start
+        epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
 
         if global_rank == 0:
             logger.info(
                 f"Epoch {epoch+1}/{epochs} complete — "
-                f"avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s | "
+                f"avg_loss={avg_loss:.4f} | time={epoch_time_str} | "
                 f"effective_batch={effective_batch}"
             )
             writer.add_scalar('Loss/epoch_avg', avg_loss, epoch)
@@ -529,8 +373,7 @@ def train(config: dict):
         logger.info(f"Best model: {checkpoint_dir / f'{size}_best.pt'}")
         logger.info("=" * 70)
 
-    if is_ddp:
-        dist.destroy_process_group()
+    cleanup_ddp(is_ddp)
 
 
 if __name__ == '__main__':
