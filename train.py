@@ -226,7 +226,12 @@ def train(config: dict):
     # ---- DDP Setup ----
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
-        dist.init_process_group(backend="nccl")
+        from datetime import timedelta
+        # Increase timeout to 3 hours to accommodate long validation runs.
+        # DDP's forward() broadcasts buffers as a collective op (BROADCAST),
+        # so ALL ranks must participate. If rank 0 is validating for 30+ min
+        # while other ranks are waiting, the default 30-min timeout kills them.
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=3))
         local_rank  = int(os.environ["LOCAL_RANK"])
         global_rank = int(os.environ["RANK"])
         world_size  = int(os.environ["WORLD_SIZE"])
@@ -489,16 +494,13 @@ def train(config: dict):
             }, ckpt_path)
             logger.info(f"  Saved checkpoint: {ckpt_path}")
 
-        # ---- Validation (rank 0 only, no barrier needed) ----
-        # NOTE: No dist.barrier() after validation. Validation can take 30+ min
-        # which exceeds NCCL's default timeout. The next epoch's forward pass
-        # naturally synchronizes all ranks via DDP's gradient all-reduce.
+        # ---- Validation (rank 0 only) ----
         if (epoch + 1) % val_freq == 0:
             if global_rank == 0:
                 logger.info("  Running validation...")
                 metrics = validate(raw_model, val_dataset, device, logger)
                 logger.info(
-                    f"  Val — PSNR: {metrics['psnr']:.4f} | "
+                    f"  Val -- PSNR: {metrics['psnr']:.4f} | "
                     f"SSIM: {metrics['ssim']:.4f} | LPIPS: {metrics['lpips']:.4f}"
                 )
                 writer.add_scalar('Metrics/PSNR',  metrics['psnr'],  epoch)
@@ -510,6 +512,13 @@ def train(config: dict):
                     best_path = checkpoint_dir / f"{size}_best.pt"
                     torch.save(raw_model.state_dict(), best_path)
                     logger.info(f"  * New best PSNR {best_psnr:.4f} -> saved to {best_path}")
+
+            # Barrier is REQUIRED here. DDP's forward() broadcasts buffers as a
+            # collective — if ranks 1-7 race ahead to the next epoch's forward()
+            # while rank 0 is still validating, the BROADCAST op times out.
+            # The NCCL timeout is set to 3 hours to accommodate long validation.
+            if is_ddp:
+                dist.barrier()
 
     # ---- Cleanup ----
     if global_rank == 0:
