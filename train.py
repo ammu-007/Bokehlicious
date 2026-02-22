@@ -33,6 +33,11 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 
+# Pillow 10.0.0 removed PIL.Image.ANTIALIAS; TensorBoard's add_images uses it internally.
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+
 from torchmetrics.functional.image import (
     peak_signal_noise_ratio as psnr_fn,
     structural_similarity_index_measure as ssim_fn,
@@ -446,27 +451,6 @@ def train(config: dict):
             )
             writer.add_scalar('Loss/epoch_avg', avg_loss, epoch)
 
-            # ---- Weight & gradient histograms ----
-            # TensorBoard's add_histogram uses NumPy internally and only
-            # supports float32. Cast everything to float32 on CPU first to
-            # avoid "No loop matching signature" TypeError with bfloat16/fp16.
-            for name, param in raw_model.named_parameters():
-                if param.requires_grad:
-                    try:
-                        writer.add_histogram(
-                            f'Weights/{name}',
-                            param.data.detach().cpu().float(),
-                            epoch,
-                        )
-                        if param.grad is not None:
-                            writer.add_histogram(
-                                f'Gradients/{name}',
-                                param.grad.data.detach().cpu().float(),
-                                epoch,
-                            )
-                    except Exception as hist_e:
-                        logger.warning(f"  add_histogram failed for '{name}': {hist_e}")
-
             writer.flush()
 
         # ---- Sample images to TensorBoard ----
@@ -504,10 +488,11 @@ def train(config: dict):
                 'config':    config,
             }, ckpt_path)
             logger.info(f"  Saved checkpoint: {ckpt_path}")
-        if is_ddp:
-            dist.barrier()  # all ranks wait for rank 0 to finish saving
 
-        # ---- Validation ----
+        # ---- Validation (rank 0 only, no barrier needed) ----
+        # NOTE: No dist.barrier() after validation. Validation can take 30+ min
+        # which exceeds NCCL's default timeout. The next epoch's forward pass
+        # naturally synchronizes all ranks via DDP's gradient all-reduce.
         if (epoch + 1) % val_freq == 0:
             if global_rank == 0:
                 logger.info("  Running validation...")
@@ -524,10 +509,7 @@ def train(config: dict):
                     best_psnr = metrics['psnr']
                     best_path = checkpoint_dir / f"{size}_best.pt"
                     torch.save(raw_model.state_dict(), best_path)
-                    logger.info(f"  * New best PSNR {best_psnr:.4f} → saved to {best_path}")
-
-            if is_ddp:
-                dist.barrier()  # sync after validation
+                    logger.info(f"  * New best PSNR {best_psnr:.4f} -> saved to {best_path}")
 
     # ---- Cleanup ----
     if global_rank == 0:
