@@ -22,6 +22,7 @@ from method.nn_util import (
     ApertureAwareAttention,
     DynRelPos2d,
     DWConv2d,
+    LayerNorm2d,
 )
 from method.blocks import FeedForwardNetwork
 
@@ -77,16 +78,20 @@ class BasicBlock(nn.Module):
             )
         else:
             self.conv1 = conv3x3(inplanes, planes, stride)
+        self.norm1 = LayerNorm2d(planes)
         self.activation = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
+        self.norm2 = LayerNorm2d(planes)
         self.downsample = downsample
         self.stride = stride
 
     def forward(self, x):
         identity = x
         out = self.conv1(x)
+        out = self.norm1(out)
         out = self.activation(out)
         out = self.conv2(out)
+        out = self.norm2(out)
         if self.downsample is not None:
             identity = self.downsample(x)
         out += identity
@@ -121,10 +126,13 @@ class ResNet_D(nn.Module):
 
         self.conv1 = nn.Conv2d(input_channels, self.channel[0], kernel_size=3,
                                stride=self.start_stride[0], padding=1, bias=False)
+        self.norm1 = LayerNorm2d(self.channel[0])
         self.conv2 = nn.Conv2d(self.channel[0], self.midplanes, kernel_size=3,
                                stride=self.start_stride[1], padding=1, bias=False)
+        self.norm2 = LayerNorm2d(self.midplanes)
         self.conv3 = nn.Conv2d(self.midplanes, self.inplanes, kernel_size=3,
                                stride=self.start_stride[2], padding=1, bias=False)
+        self.norm3 = LayerNorm2d(self.inplanes)
         self.activation = nn.ReLU(inplace=True)
 
         self.layer1 = self._make_layer(block, self.channel[1], layers[0], stride=self.start_stride[3])
@@ -155,10 +163,12 @@ class ResNet_D(nn.Module):
             downsample = nn.Sequential(
                 nn.AvgPool2d(stride, stride),
                 conv1x1(self.inplanes, planes * block.expansion),
+                LayerNorm2d(planes * block.expansion),
             )
         elif self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 conv1x1(self.inplanes, planes * block.expansion, stride),
+                LayerNorm2d(planes * block.expansion),
             )
         layers = [block(self.inplanes, planes, stride, downsample)]
         self.inplanes = planes * block.expansion
@@ -168,8 +178,10 @@ class ResNet_D(nn.Module):
 
     def forward(self, x):
         x = self.conv1(x)                  # (B, 32, 352, 352)
+        x = self.norm1(x)
         x = self.activation(x)
         x = self.conv2(x)                  # (B, 32, 352, 352)
+        x = self.norm2(x)
         x1 = self.activation(x)            # (B, 32, 352, 352)
         x2 = self.layer1(x1)               # (B, 64, 176, 176)
         x3 = self.layer2(x2)               # (B, 128, 88, 88)
@@ -237,16 +249,18 @@ class FeatureFusionBlock_custom(nn.Module):
         self.resConfUnit2 = ResidualConvUnit_custom(features, activation, bn)
         self.skip_add = nn.quantized.FloatFunctional()
 
+        self.upsample = nn.Sequential(
+            nn.Conv2d(features, out_features * 4, kernel_size=3, padding=1, bias=True),
+            nn.PixelShuffle(2)
+        )
+
     def forward(self, *xs):
         output = xs[0]
         if len(xs) == 2:
             res = self.resConfUnit1(xs[1])
             output = self.skip_add.add(output, res)
         output = self.resConfUnit2(output)
-        output = nn.functional.interpolate(
-            output, scale_factor=2, mode="bilinear", align_corners=self.align_corners
-        )
-        output = self.out_conv(output)
+        output = self.upsample(output)
         return output
 
 
@@ -565,8 +579,8 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
         head1 = nn.Sequential(
             nn.Conv2d(features[0], features[0] // 2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
-            Interpolate(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(features[0] // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(features[0] // 2, 32 * 4, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
             nn.ReLU(True),
             nn.Identity()
         )
@@ -592,7 +606,7 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
         self.scratch.output_conv1 = head1
         self.scratch.output_conv2 = head2
 
-        self.downsample = Interpolate(scale_factor=0.5, mode="bilinear", align_corners=False)
+        self.downsample = nn.Conv2d(encoder_in_channels, encoder_in_channels, kernel_size=4, stride=2, padding=1, bias=False)
 
     def forward(self, *inputs):
         """
