@@ -344,7 +344,7 @@ class ApertureAttentionBlock(nn.Module):
 
 class ResidualGroup(nn.Module):
     """
-    Residual Group: N x AAB + CoordConv + group-level skip connection.
+    Residual Group: N x AAB + auxiliary-conditioned conv + group-level skip.
 
     Handles BCHW <-> BHWC format conversions at group boundaries so the
     rest of the BBNet pipeline (encoder, decoder) stays in BCHW.
@@ -355,23 +355,23 @@ class ResidualGroup(nn.Module):
             -> AAB_2(x, rel_pos)
             -> AAB_3(x, rel_pos)
         -> permute(BCHW)
-        -> cat(x, coord_map)     [if coord_conv]
-        -> Conv2d(C+2 -> C, 3x3)
+        -> cat(x, coord_map, kernel_map)  [if enabled]
+        -> Conv2d(C+3 -> C, 3x3)
         -> + skip (group residual)
 
-    Tensor trace (dim=256, 3 blocks, coord_conv=True, 44x44):
+    Tensor trace (dim=256, 3 blocks, coord+kernel, 44x44):
         Input:  (B, 256, 44, 44)  BCHW
         permute: (B, 44, 44, 256) BHWC
         3x AAB: (B, 44, 44, 256) BHWC
         permute: (B, 256, 44, 44) BCHW
-        cat:    (B, 258, 44, 44)  BCHW  -- +2 for coord channels
+        cat:    (B, 259, 44, 44)  BCHW  -- +2 coord +1 kernel
         conv:   (B, 256, 44, 44)  BCHW
         +skip:  (B, 256, 44, 44)  BCHW
         Output: (B, 256, 44, 44)
     """
 
     def __init__(self, dim, num_heads, num_blocks=3, ffn_ratio=2.,
-                 coord_conv=True, drop_path=0.):
+                 use_coord_conv=True, use_kernel_conv=True, drop_path=0.):
         super().__init__()
         ffn_dim = int(dim * ffn_ratio)
 
@@ -386,16 +386,19 @@ class ResidualGroup(nn.Module):
             for i in range(num_blocks)
         ])
 
-        self.coord_conv = coord_conv
-        conv_in = dim + 2 if coord_conv else dim
-        self.conv = nn.Conv2d(conv_in, dim, kernel_size=3, stride=1, padding=1)
+        self.use_coord_conv = use_coord_conv
+        self.use_kernel_conv = use_kernel_conv
+        extra_ch = (2 if use_coord_conv else 0) + (1 if use_kernel_conv else 0)
+        self.extra_ch = extra_ch
+        self.conv = nn.Conv2d(dim + extra_ch, dim, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, x, rel_pos, coord_map=None):
+    def forward(self, x, rel_pos, coord_map=None, kernel_map=None):
         """
         Args:
             x: (B, C, H, W) feature tensor in BCHW format
             rel_pos: tuple (mask_h, mask_w) from DynRelPos2d
-            coord_map: (B, 2, H, W) coordinate maps from pipeline, or None
+            coord_map: (B, 2, H, W) coordinate maps, or None
+            kernel_map: (B, 1, H, W) CoC map at bottleneck resolution, or None
         Returns:
             (B, C, H, W) in BCHW format
         """
@@ -410,14 +413,22 @@ class ResidualGroup(nn.Module):
         # BHWC -> BCHW
         x = x.permute(0, 3, 1, 2)
 
-        # CoordConv: concatenate coordinate maps before group conv
-        if self.coord_conv:
+        # Concatenate auxiliary maps before group boundary conv
+        aux = []
+        if self.use_coord_conv:
             if coord_map is not None:
-                x = torch.cat([x, coord_map], dim=1)      # (B, C+2, H, W)
+                aux.append(coord_map)                                       # (B, 2, H, W)
             else:
-                # Fallback: zero coord channels to keep conv dimensions valid
-                B, C, H, W = x.shape
-                x = torch.cat([x, torch.zeros(B, 2, H, W, device=x.device, dtype=x.dtype)], dim=1)
+                B_, C_, H_, W_ = x.shape
+                aux.append(torch.zeros(B_, 2, H_, W_, device=x.device, dtype=x.dtype))
+        if self.use_kernel_conv:
+            if kernel_map is not None:
+                aux.append(kernel_map)                                      # (B, 1, H, W)
+            else:
+                B_, C_, H_, W_ = x.shape
+                aux.append(torch.zeros(B_, 1, H_, W_, device=x.device, dtype=x.dtype))
+        if aux:
+            x = torch.cat([x] + aux, dim=1)                                 # (B, C+3, H, W)
 
         x = self.conv(x)
 
@@ -432,8 +443,20 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
     """
     BBNet-AAA: ResNet-D encoder + 3xRG AAA bottleneck + DPT decoder.
 
-    Full pipeline tensor trace (B=1, 6ch input at 1408x1408):
-        Input:   (1, 6, 1408, 1408)
+    Inputs (passed as *inputs tuple):
+        inputs[0]: source       (B, 3, H, W)  - RGB image
+        inputs[1]: kernel_map   (B, 1, H, W)  - Circle of Confusion map
+        inputs[2]: bloom_input  (B, 1, H, W)  - Specular highlight map
+        inputs[3]: coord_maps   (B, 2, H, W)  - Normalized spatial coordinates
+        inputs[4]: f_stop       (B,)          - Aperture value
+
+    Injection strategy:
+        Encoder (6ch):  source(3) + kernel_map(1) + coord_maps(2)
+        Bottleneck:     f_stop -> DynRelPos2d; coord_maps(2) + kernel_map(1) at RG conv
+        Output head:    bloom_input(1) late injection
+
+    Full pipeline tensor trace (B=1, 1408x1408):
+        Encoder input: cat(source, kernel_map, coord_maps) -> (1, 6, 1408, 1408)
         |-- downsample 0.5x:  (1, 6, 704, 704)
         |-- ResNet-D encoder:
         |   x1: (1, 32, 352, 352)
@@ -449,9 +472,9 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
         |
         |-- AAA Bottleneck @ 44x44:
         |   DynRelPos2d(f_stop) -> (mask_h, mask_w)
-        |   RG1: 3x AAB(256, heads=4)  -> (1, 256, 44, 44)
-        |   RG2: 3x AAB(256, heads=4)  -> (1, 256, 44, 44)
-        |   RG3: 3x AAB(256, heads=4)  -> (1, 256, 44, 44)
+        |   RG1: 3x AAB(256, heads=4) + conv(C+3->C)  -> (1, 256, 44, 44)
+        |   RG2: 3x AAB(256, heads=4) + conv(C+3->C)  -> (1, 256, 44, 44)
+        |   RG3: 3x AAB(256, heads=4) + conv(C+3->C)  -> (1, 256, 44, 44)
         |
         |-- DPT decoder (refinenets):
         |   path_4: (1, 256, 88, 88)
@@ -460,9 +483,9 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
         |   path_1: (1, 128, 704, 704)
         |
         |-- Head:
-        |   head1: (1, 32, 1408, 1408)  -- from decoder path
-        |   head2: (1, 32, 1408, 1408)  -- from HR input
-        |   cat + head: (1, 3, 1408, 1408)
+        |   head1: (1, 32, 1408, 1408) -- from decoder path
+        |   head2: (1, 32, 1408, 1408) -- from HR source
+        |   cat(head1, head2, bloom) + head: (1, 3, 1408, 1408)
         |
         Output: (1, 3, 1408, 1408)
     """
@@ -487,7 +510,8 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
             bottleneck_ffn_ratio=2.,
             num_residual_groups=3,
             blocks_per_group=3,
-            coord_conv=True,
+            use_coord_conv=True,
+            use_kernel_conv=True,
             drop_path_rate=0.05,
             # DynRelPos2d parameters
             relpos_init_value=2,
@@ -531,7 +555,8 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
                     num_heads=bottleneck_heads,
                     num_blocks=blocks_per_group,
                     ffn_ratio=bottleneck_ffn_ratio,
-                    coord_conv=coord_conv,
+                    use_coord_conv=use_coord_conv,
+                    use_kernel_conv=use_kernel_conv,
                     drop_path=dpr[start:end],
                 )
             )
@@ -546,14 +571,16 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
             nn.Identity()
         )
 
+        # head2: HR branch processes source RGB only (3ch)
         head2 = nn.Sequential(
-            nn.Conv2d(encoder_in_channels, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Identity(),
         )
 
+        # head: +1 bloom channel for late specular highlight injection
         head = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64 + 1, 32, kernel_size=3, stride=1, padding=1),   # 32+32+1 bloom
             nn.ReLU(True),
             nn.Identity(),
             nn.Conv2d(32, out_channels, kernel_size=1, stride=1, padding=0),
@@ -567,71 +594,68 @@ class Inception_Encoder_Unet_Decoder(BaseModel):
 
         self.downsample = Interpolate(scale_factor=0.5, mode="bilinear", align_corners=False)
 
-    def forward(self, x, f_stop=None, coord_map=None):
+    def forward(self, *inputs):
         """
         Forward pass.
 
         Args:
-            x: (B, 6, 1408, 1408) input tensor (RGB + depth + focus + alpha)
-            f_stop: (B,) tensor of aperture values for aperture-aware attention.
-                    Controls the spatial decay in attention — smaller f_stop = wider
-                    bokeh = broader attention, larger f_stop = sharper = local attention.
-            coord_map: (B, 2, H, W) coordinate maps from the pipeline for CoordConv.
-                       Will be downsampled to bottleneck resolution internally.
+            inputs[0]: source       (B, 3, H, W)  - RGB image
+            inputs[1]: kernel_map   (B, 1, H, W)  - Circle of Confusion (blur radius per pixel)
+            inputs[2]: bloom_input  (B, 1, H, W)  - Specular highlight map
+            inputs[3]: coord_maps   (B, 2, H, W)  - Normalized spatial coordinates
+            inputs[4]: f_stop       (B,)          - Aperture value for attention decay
 
         Returns:
-            (B, 3, 1408, 1408) output bokeh-rendered image
+            (B, 3, H, W) output bokeh-rendered image
         """
-        HR = x                              # (B, 6, 1408, 1408)
-        LR = self.downsample(x)             # (B, 6, 704, 704)
+        source, kernel_map, bloom_input, coord_maps, f_stop = inputs
+
+        # ── Build encoder input: source(3) + kernel_map(1) + coord_maps(2) = 6ch ──
+        encoder_input = torch.cat([source, kernel_map, coord_maps], dim=1)  # (B, 6, H, W)
+        LR = self.downsample(encoder_input)                                 # (B, 6, H/2, W/2)
 
         # ── Encoder ──
         layer1, layer2, layer3, layer4 = self.resnet(LR)
-        # layer1: (B, 32, 352, 352)
-        # layer2: (B, 64, 176, 176)
-        # layer3: (B, 128, 88, 88)
-        # layer4: (B, 256, 44, 44)
+        # layer1: (B, 32, H/4, W/4)    e.g. 352x352
+        # layer2: (B, 64, H/8, W/8)    e.g. 176x176
+        # layer3: (B, 128, H/16, W/16) e.g. 88x88
+        # layer4: (B, 256, H/32, W/32) e.g. 44x44
 
         # ── Scratch reassembly ──
-        layer_1_rn = self.scratch.layer1_rn(layer1)     # (B, 128, 352, 352)
-        layer_2_rn = self.scratch.layer2_rn(layer2)     # (B, 128, 176, 176)
-        layer_3_rn = self.scratch.layer3_rn(layer3)     # (B, 256, 88, 88)
-        layer_4_rn = self.scratch.layer4_rn(layer4)     # (B, 256, 44, 44)
+        layer_1_rn = self.scratch.layer1_rn(layer1)     # (B, 128, H/4, W/4)
+        layer_2_rn = self.scratch.layer2_rn(layer2)     # (B, 128, H/8, W/8)
+        layer_3_rn = self.scratch.layer3_rn(layer3)     # (B, 256, H/16, W/16)
+        layer_4_rn = self.scratch.layer4_rn(layer4)     # (B, 256, H/32, W/32)
 
         # ── AAA Bottleneck ──
-        B, C, H_bn, W_bn = layer_4_rn.shape            # (B, 256, 44, 44)
+        B, C, H_bn, W_bn = layer_4_rn.shape             # (B, 256, 44, 44)
 
-        # Generate aperture-aware positional decay masks
-        if f_stop is not None:
-            rel_pos = self.relpos((H_bn, W_bn), range_factor=f_stop)
-        else:
-            # Default fallback: neutral decay (f_stop=1.0 for all batch elements)
-            rel_pos = self.relpos((H_bn, W_bn),
-                                  range_factor=torch.ones(B, device=x.device))
+        # Generate aperture-aware positional decay masks from f_stop
+        rel_pos = self.relpos((H_bn, W_bn), range_factor=f_stop)
 
-        # Downsample coord_map to bottleneck resolution if provided
-        if coord_map is not None:
-            coord_map_bn = F.interpolate(coord_map, size=(H_bn, W_bn),
-                                         mode='bilinear', align_corners=False)
-        else:
-            coord_map_bn = None
+        # Downsample auxiliary maps to bottleneck resolution
+        coord_map_bn = F.interpolate(coord_maps, size=(H_bn, W_bn),
+                                      mode='bilinear', align_corners=False)
+        kernel_map_bn = F.interpolate(kernel_map, size=(H_bn, W_bn),
+                                       mode='bilinear', align_corners=False)
 
-        # Pass through 3 Residual Groups
+        # Pass through 3 Residual Groups (coord + kernel conditioning at each)
         for rg in self.residual_groups:
-            layer_4_rn = rg(layer_4_rn, rel_pos, coord_map_bn)
+            layer_4_rn = rg(layer_4_rn, rel_pos, coord_map_bn, kernel_map_bn)
 
         # ── DPT Decoder ──
-        path_4 = self.scratch.refinenet4(layer_4_rn)            # (B, 256, 88, 88)
-        path_3 = self.scratch.refinenet3(path_4, layer_3_rn)    # (B, 128, 176, 176)
-        path_2 = self.scratch.refinenet2(path_3, layer_2_rn)    # (B, 128, 352, 352)
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)    # (B, 128, 704, 704)
+        path_4 = self.scratch.refinenet4(layer_4_rn)            # (B, 256, H/16, W/16)
+        path_3 = self.scratch.refinenet3(path_4, layer_3_rn)    # (B, 128, H/8, W/8)
+        path_2 = self.scratch.refinenet2(path_3, layer_2_rn)    # (B, 128, H/4, W/4)
+        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)    # (B, 128, H/2, W/2)
 
         # ── Output heads ──
-        out1 = self.scratch.output_conv1(path_1)    # (B, 32, 1408, 1408)
-        HR = self.scratch.output_conv2(HR)          # (B, 32, 1408, 1408)
+        out1 = self.scratch.output_conv1(path_1)                # (B, 32, H, W)
+        HR = self.scratch.output_conv2(source)                  # (B, 32, H, W) source-only
 
-        out = torch.cat((out1, HR), 1)              # (B, 64, 1408, 1408)
-        out = self.scratch.output_conv(out)         # (B, 3, 1408, 1408)
+        # Late bloom injection: cat decoder + HR + bloom → head
+        out = torch.cat((out1, HR, bloom_input), 1)             # (B, 65, H, W)
+        out = self.scratch.output_conv(out)                     # (B, 3, H, W)
 
         return out
 
@@ -655,14 +679,19 @@ if __name__ == "__main__":
     print(f"Bottleneck parameters: {bottleneck_params:>12,}")
     print(f"Other parameters:      {total_params - bottleneck_params:>12,}")
 
-    # Forward pass test
-    x = torch.rand((1, 6, 1408, 1408))
-    f_stop = torch.tensor([2.0])
-    coord_map = torch.rand((1, 2, 1408, 1408))
+    # Forward pass test with tuple inputs
+    H, W = 352, 352
+    source      = torch.rand((1, 3, H, W))
+    kernel_map  = torch.rand((1, 1, H, W))
+    bloom_input = torch.rand((1, 1, H, W))
+    coord_maps  = torch.rand((1, 2, H, W))
+    f_stop      = torch.tensor([2.0])
 
-    print(f"\nInput shape:     {x.shape}")
-    print(f"f_stop:          {f_stop}")
-    print(f"coord_map shape: {coord_map.shape}")
+    print(f"\nsource:      {source.shape}")
+    print(f"kernel_map:  {kernel_map.shape}")
+    print(f"bloom_input: {bloom_input.shape}")
+    print(f"coord_maps:  {coord_maps.shape}")
+    print(f"f_stop:      {f_stop}")
 
-    output = model(x, f_stop=f_stop, coord_map=coord_map)
-    print(f"Output shape:    {output.shape}")
+    output = model(source, kernel_map, bloom_input, coord_maps, f_stop)
+    print(f"Output:      {output.shape}")
