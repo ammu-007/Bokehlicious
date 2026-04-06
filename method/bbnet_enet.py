@@ -230,6 +230,15 @@ class FeatureFusionBlock_custom(nn.Module):
             bias=True,
             groups=1,
         )
+        self.pixel_shuffle_expand = nn.Conv2d(
+            out_features, 
+            out_features * 4, 
+            kernel_size=1, 
+            stride=1, 
+            padding=0, 
+            bias=True
+        )
+        self.pixel_shuffle = nn.PixelShuffle(2)
 
         self.resConfUnit1 = ResidualConvUnit_custom(features, activation, bn)
         self.resConfUnit2 = ResidualConvUnit_custom(features, activation, bn)
@@ -249,12 +258,9 @@ class FeatureFusionBlock_custom(nn.Module):
             output = self.skip_add.add(output, res)
 
         output = self.resConfUnit2(output)
-
-        output = nn.functional.interpolate(
-            output, scale_factor=2, mode="bilinear", align_corners=self.align_corners
-        )
-
         output = self.out_conv(output)
+        output = self.pixel_shuffle_expand(output)
+        output = self.pixel_shuffle(output)
 
         return output
 
@@ -326,7 +332,7 @@ class Interpolate(nn.Module):
 class Enet_Encoder_Unet_Decoder(BaseModel):
     def __init__(
             self,
-            encoder_in_channels = 6,
+            encoder_in_channels = 5,
             out_channels = 3,
             encoder_name = 'efficientnet_b2',
             features=[128, 128, 256, 256],
@@ -339,6 +345,36 @@ class Enet_Encoder_Unet_Decoder(BaseModel):
 
         self.encoder = timm.create_model(encoder_name, pretrained=True, in_chans=encoder_in_channels, features_only=True, out_indices=(1, 2, 3, 4))
         encoder_channels = self.encoder.feature_info.channels()
+
+        self.coord_adapter = nn.Conv2d(features[3] + 2, features[3], kernel_size=1)
+        
+        # Parallel HR Stream
+        hr_dim = 16
+        self.hr_entry = nn.Conv2d(encoder_in_channels, hr_dim, kernel_size=3, stride=1, padding=1)
+        
+        self.hr_block4 = ResidualConvUnit_custom(hr_dim, nn.ReLU(), bn=True)
+        self.hr_fuse4 = nn.Sequential(
+            nn.Conv2d(features[2], hr_dim, kernel_size=1),
+            Interpolate(scale_factor=32, mode="bilinear", align_corners=False)
+        )
+        
+        self.hr_block3 = ResidualConvUnit_custom(hr_dim, nn.ReLU(), bn=True)
+        self.hr_fuse3 = nn.Sequential(
+            nn.Conv2d(features[1], hr_dim, kernel_size=1),
+            Interpolate(scale_factor=16, mode="bilinear", align_corners=False)
+        )
+        
+        self.hr_block2 = ResidualConvUnit_custom(hr_dim, nn.ReLU(), bn=True)
+        self.hr_fuse2 = nn.Sequential(
+            nn.Conv2d(features[0], hr_dim, kernel_size=1),
+            Interpolate(scale_factor=8, mode="bilinear", align_corners=False)
+        )
+        
+        self.hr_block1 = ResidualConvUnit_custom(hr_dim, nn.ReLU(), bn=True)
+        self.hr_fuse1 = nn.Sequential(
+            nn.Conv2d(features[0], hr_dim, kernel_size=1),
+            Interpolate(scale_factor=4, mode="bilinear", align_corners=False)
+        )
 
         self.scratch = _make_scratch(encoder_channels, features, groups=1, expand=False)
         self.scratch.refinenet1 = _make_fusion_block(features[0], features[0], use_bn)
@@ -371,7 +407,7 @@ class Enet_Encoder_Unet_Decoder(BaseModel):
         )
 
         head = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(80, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Identity(),
             nn.Conv2d(32, out_channels, kernel_size=1, stride=1, padding=0),   # 4 channel op prediction RGB + segmask
@@ -386,9 +422,12 @@ class Enet_Encoder_Unet_Decoder(BaseModel):
         self.downsample = Interpolate(scale_factor=0.5, mode="bilinear", align_corners=False)
 
 
-    def forward(self, x):
-        HR = x  #x [1, 6, 1408, 1408] 
-        LR = self.downsample(x) # LR [1, 6, 704, 704] 
+    def forward(self, source, kernel_map, bloom_input, coord_maps, f_stop=None):
+        enc_in = torch.cat([source, kernel_map, bloom_input], dim=1)  # [1, 5, 1408, 1408]
+        LR = self.downsample(enc_in) # LR [1, 5, 704, 704] 
+        
+        # Parallel HR Stream Entry
+        hr_stream = self.hr_entry(enc_in) # 1408x1408
         
         features = self.encoder(LR)
         layer1, layer2, layer3, layer4 = features[0], features[1], features[2], features[3]
@@ -398,17 +437,29 @@ class Enet_Encoder_Unet_Decoder(BaseModel):
         layer_3_rn = self.scratch.layer3_rn(layer3) 
         layer_4_rn = self.scratch.layer4_rn(layer4) 
         
+        # Injection of Coordinate Maps into Bottleneck
+        coords_down = F.interpolate(coord_maps, size=layer_4_rn.shape[-2:], mode='bilinear', align_corners=False)
+        layer_4_rn = torch.cat([layer_4_rn, coords_down], dim=1)
+        layer_4_rn = self.coord_adapter(layer_4_rn)
+
         layer_4_rn = self.transformer_layer(layer_4_rn )
 
         path_4 = self.scratch.refinenet4(layer_4_rn)
+        hr_stream = self.hr_block4(hr_stream + self.hr_fuse4(path_4))
+
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn)
+        hr_stream = self.hr_block3(hr_stream + self.hr_fuse3(path_3))
+
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn)
+        hr_stream = self.hr_block2(hr_stream + self.hr_fuse2(path_2))
+
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+        hr_stream = self.hr_block1(hr_stream + self.hr_fuse1(path_1))
         
         out1 = self.scratch.output_conv1(path_1)
-        HR = self.scratch.output_conv2(HR)
+        HR = self.scratch.output_conv2(enc_in)
         
-        out = torch.cat((out1, HR), 1)
+        out = torch.cat((out1, HR, hr_stream), 1)
         out = self.scratch.output_conv(out)
         
         return out
@@ -418,11 +469,15 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     model = Enet_Encoder_Unet_Decoder()
-    input = torch.rand((1, 6, 1408, 1408))
-    print("Testing forward pass...")
-    output = model(input)
+    source = torch.rand((1, 3, 1408, 1408))
+    kernel_map = torch.rand((1, 1, 1408, 1408))
+    bloom_input = torch.rand((1, 1, 1408, 1408))
+    coord_maps = torch.rand((1, 2, 1408, 1408))
+    f_stop = torch.rand((1, 1))
     
-    print("Input shape:",input.shape)
+    print("Testing forward pass...")
+    output = model(source, kernel_map, bloom_input, coord_maps, f_stop)
+    
     print("Output shape:",output.shape)
 
     params = sum(p.numel() for p in model.parameters())
